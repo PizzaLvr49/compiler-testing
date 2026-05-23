@@ -1,0 +1,17 @@
+[package]
+name = "compiler-testing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ariadne = { version = "0.6.0", features = ["auto-color"] }
+chumsky = { version = "0.13.0", features = [
+    "pratt",
+    "memoization",
+    "lexical-numbers",
+] }
+cranelift = { version = "0.132.0", features = ["jit", "module", "native"] }
+
+[lints.clippy]
+pedantic = { priority = -1, level = "warn" }
+nursery = { priority = -1, level = "warn" }
