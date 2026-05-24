@@ -200,6 +200,7 @@ dependencies = [
  "clap",
  "cranelift",
  "slotmap",
+ "sysexits",
  "thiserror",
 ]
 
@@ -810,6 +811,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "sysexits"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5dffab7eaf1889aaff43c92ee7ffaeeb0d34de8214867c41c6e7587361f867f7"
 
 [[package]]
 name = "target-lexicon"

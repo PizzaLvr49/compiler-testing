@@ -13,6 +13,7 @@ chumsky = { version = "0.13.0", features = [
 clap = { version = "4.6.1", features = ["derive"] }
 cranelift = { version = "0.132.0", features = ["jit", "module", "native"] }
 slotmap = "1.1.1"
+sysexits = "0.13.0"
 thiserror = "2.0.18"
 
 [lints.clippy]

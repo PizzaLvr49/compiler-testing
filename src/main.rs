@@ -7,6 +7,7 @@ use cranelift::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use sysexits::ExitCode;
 use thiserror::Error;
 
 slotmap::new_key_type! {
@@ -480,28 +481,12 @@ struct Args {
     file: PathBuf,
 }
 
-enum ExitCode {
-    Success,
-    UsageError,
-    CompileError,
-}
-
-impl std::process::Termination for ExitCode {
-    fn report(self) -> std::process::ExitCode {
-        match self {
-            Self::Success => std::process::ExitCode::SUCCESS,
-            Self::UsageError => std::process::ExitCode::from(64),
-            Self::CompileError => std::process::ExitCode::from(65),
-        }
-    }
-}
-
 fn main() -> ExitCode {
     let args = match Args::try_parse() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::UsageError;
+            return ExitCode::Usage;
         }
     };
 
@@ -511,7 +496,7 @@ fn main() -> ExitCode {
         Ok(content) => content,
         Err(err) => {
             eprintln!("Error: Failed to read file '{file_path_str}': {err}");
-            return ExitCode::UsageError;
+            return ExitCode::IoErr;
         }
     };
 
@@ -541,9 +526,9 @@ fn main() -> ExitCode {
             Ok(output) => println!("{output}"),
             Err(compiler_err) => {
                 eprintln!("Compilation failed: {compiler_err}");
-                return ExitCode::CompileError;
+                return ExitCode::DataErr;
             }
         }
     }
-    ExitCode::Success
+    ExitCode::Ok
 }
