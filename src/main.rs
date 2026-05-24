@@ -369,7 +369,7 @@ impl JITCompiler {
             .map_err(|e| CompilerError::JitError(e.to_string()))?;
 
         let code = self.module.get_finalized_function(id);
-        let func: fn() -> f64 = unsafe { std::mem::transmute(code) };
+        let func: extern "C" fn() -> f64 = unsafe { std::mem::transmute(code) };
         Ok(func())
     }
 }
