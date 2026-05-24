@@ -1,43 +1,73 @@
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use chumsky::prelude::*;
+use clap::Parser as ClapParser;
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{FuncId, Linkage, Module, default_libcall_names};
 use cranelift::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use thiserror::Error;
+
+slotmap::new_key_type! {
+    struct NodeId;
+}
 
 #[derive(Debug)]
-enum Expr<'src> {
+enum Node<'src> {
     Num(f64),
     Var(&'src str),
-
-    Neg(Box<Self>),
-    Add(Box<Self>, Box<Self>),
-    Sub(Box<Self>, Box<Self>),
-    Mul(Box<Self>, Box<Self>),
-    Div(Box<Self>, Box<Self>),
-
-    Call(&'src str, Vec<Self>),
-
+    Neg(NodeId),
+    Add(NodeId, NodeId),
+    Sub(NodeId, NodeId),
+    Mul(NodeId, NodeId),
+    Div(NodeId, NodeId),
+    Call(&'src str, Vec<NodeId>),
     Let {
         name: &'src str,
-        rhs: Box<Self>,
-        then: Box<Self>,
+        rhs: NodeId,
+        then: NodeId,
     },
-
     Fn {
         name: &'src str,
         args: Vec<&'src str>,
-        body: Box<Self>,
-        then: Box<Self>,
+        body: NodeId,
+        then: NodeId,
     },
 }
 
+#[derive(Error, Debug)]
+enum CompilerError {
+    #[error("Variable `{0}` not found in scope")]
+    VariableNotFound(String),
+
+    #[error("Function `{0}` not found in scope")]
+    FunctionNotFound(String),
+
+    #[error("Wrong number of arguments for function `{name}`: expected {expected}, found {found}")]
+    ArgumentCountMismatch {
+        name: String,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error("Redefinition of function `{0}` in the same scope")]
+    DuplicateFunction(String),
+
+    #[error("JIT Compilation Error: {0}")]
+    JitError(String),
+}
+
 #[expect(clippy::let_and_return)]
-fn parser<'src>() -> impl Parser<'src, &'src str, Expr<'src>, extra::Err<Rich<'src, char>>> {
+fn parser<'src, 'a>(
+    arena: &'a RefCell<slotmap::SlotMap<NodeId, Node<'src>>>,
+) -> impl Parser<'src, &'src str, NodeId, extra::Err<Rich<'src, char>>> + 'a {
+    let alloc = move |node| arena.borrow_mut().insert(node);
+
     let ident = text::ascii::ident().padded();
 
     let expr = recursive(|expr| {
-        let int = text::int(10).map(|s: &str| Expr::Num(s.parse().unwrap()));
+        let int = text::int(10).map(move |s: &str| alloc(Node::Num(s.parse().unwrap())));
 
         let call = ident
             .then(
@@ -47,14 +77,14 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Expr<'src>, extra::Err<Rich<'s
                     .collect::<Vec<_>>()
                     .delimited_by(just('(').padded(), just(')').padded()),
             )
-            .map(|(f, args)| Expr::Call(f, args));
+            .map(move |(f, args)| alloc(Node::Call(f, args)));
 
         let atom = choice((
             int,
             expr.clone()
                 .delimited_by(just('(').padded(), just(')').padded()),
             call,
-            ident.map(Expr::Var),
+            ident.map(move |s| alloc(Node::Var(s))),
         ))
         .padded();
 
@@ -62,26 +92,32 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Expr<'src>, extra::Err<Rich<'s
 
         let unary = op('-')
             .repeated()
-            .foldr(atom, |_op, rhs| Expr::Neg(Box::new(rhs)));
+            .foldr(atom, move |_op, rhs| alloc(Node::Neg(rhs)));
 
         let product = unary.clone().foldl(
-            choice((
-                op('*').to(Expr::Mul as fn(_, _) -> _),
-                op('/').to(Expr::Div as fn(_, _) -> _),
-            ))
-            .then(unary)
-            .repeated(),
-            |lhs, (op, rhs)| op(Box::new(lhs), Box::new(rhs)),
+            choice((op('*').to(0), op('/').to(1)))
+                .then(unary)
+                .repeated(),
+            move |lhs, (op, rhs)| {
+                if op == 0 {
+                    alloc(Node::Mul(lhs, rhs))
+                } else {
+                    alloc(Node::Div(lhs, rhs))
+                }
+            },
         );
 
         let sum = product.clone().foldl(
-            choice((
-                op('+').to(Expr::Add as fn(_, _) -> _),
-                op('-').to(Expr::Sub as fn(_, _) -> _),
-            ))
-            .then(product)
-            .repeated(),
-            |lhs, (op, rhs)| op(Box::new(lhs), Box::new(rhs)),
+            choice((op('+').to(0), op('-').to(1)))
+                .then(product)
+                .repeated(),
+            move |lhs, (op, rhs)| {
+                if op == 0 {
+                    alloc(Node::Add(lhs, rhs))
+                } else {
+                    alloc(Node::Sub(lhs, rhs))
+                }
+            },
         );
 
         sum
@@ -95,11 +131,7 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Expr<'src>, extra::Err<Rich<'s
             .then(expr.clone())
             .then_ignore(just(';').padded())
             .then(decl.clone())
-            .map(|((name, rhs), then)| Expr::Let {
-                name,
-                rhs: Box::new(rhs),
-                then: Box::new(then),
-            });
+            .map(move |((name, rhs), then)| alloc(Node::Let { name, rhs, then }));
 
         let r#fn = text::ascii::keyword("fn")
             .padded()
@@ -109,75 +141,19 @@ fn parser<'src>() -> impl Parser<'src, &'src str, Expr<'src>, extra::Err<Rich<'s
             .then(expr.clone())
             .then_ignore(just(';').padded())
             .then(decl)
-            .map(|(((name, args), body), then)| Expr::Fn {
-                name,
-                args,
-                body: Box::new(body),
-                then: Box::new(then),
+            .map(move |(((name, args), body), then)| {
+                alloc(Node::Fn {
+                    name,
+                    args,
+                    body,
+                    then,
+                })
             });
 
         choice((r#let, r#fn, expr)).padded()
     });
 
     decl.then_ignore(end())
-}
-
-fn validate<'src>(
-    expr: &'src Expr<'src>,
-    vars: &mut Vec<&'src str>,
-    funcs: &mut HashMap<&'src str, usize>,
-) -> Result<(), String> {
-    match expr {
-        Expr::Num(_) => Ok(()),
-        Expr::Var(name) => {
-            if vars.contains(name) {
-                Ok(())
-            } else {
-                Err(format!("Cannot find variable `{name}` in scope"))
-            }
-        }
-        Expr::Neg(a) => validate(a, vars, funcs),
-        Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => {
-            validate(a, vars, funcs)?;
-            validate(b, vars, funcs)
-        }
-        Expr::Let { name, rhs, then } => {
-            validate(rhs, vars, funcs)?;
-            vars.push(*name);
-            let res = validate(then, vars, funcs);
-            vars.pop();
-            res
-        }
-        Expr::Fn {
-            name,
-            args,
-            body,
-            then,
-        } => {
-            funcs.insert(*name, args.len());
-
-            let mut body_vars = args.clone();
-            validate(body, &mut body_vars, funcs)?;
-
-            validate(then, vars, funcs)
-        }
-        Expr::Call(name, args) => {
-            if let Some(&expected_arity) = funcs.get(name) {
-                if args.len() != expected_arity {
-                    return Err(format!(
-                        "Wrong number of arguments for function `{name}`: expected {expected_arity}, found {}",
-                        args.len()
-                    ));
-                }
-                for arg in args {
-                    validate(arg, vars, funcs)?;
-                }
-                Ok(())
-            } else {
-                Err(format!("Cannot find function `{name}` in scope"))
-            }
-        }
-    }
 }
 
 struct JITCompiler {
@@ -209,50 +185,66 @@ impl JITCompiler {
         }
     }
 
-    fn collect_and_declare_functions(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Fn {
+    fn pre_declare(
+        &mut self,
+        id: NodeId,
+        nodes: &slotmap::SlotMap<NodeId, Node<'_>>,
+        func_arities: &mut HashMap<String, usize>,
+    ) -> Result<(), CompilerError> {
+        match &nodes[id] {
+            Node::Fn {
                 name,
                 args,
                 body,
                 then,
             } => {
+                if func_arities.contains_key(*name) {
+                    return Err(CompilerError::DuplicateFunction((*name).to_string()));
+                }
+                func_arities.insert((*name).to_string(), args.len());
+
                 let mut sig = self.module.make_signature();
                 for _ in args {
                     sig.params.push(AbiParam::new(types::F64));
                 }
                 sig.returns.push(AbiParam::new(types::F64));
 
-                let id = self
+                let func_id = self
                     .module
                     .declare_function(name, Linkage::Local, &sig)
-                    .unwrap();
-                self.funcs.insert((*name).to_string(), id);
+                    .map_err(|e| CompilerError::JitError(e.to_string()))?;
+                self.funcs.insert((*name).to_string(), func_id);
 
-                self.collect_and_declare_functions(body);
-                self.collect_and_declare_functions(then);
+                self.pre_declare(*body, nodes, func_arities)?;
+                self.pre_declare(*then, nodes, func_arities)?;
             }
-            Expr::Let { rhs, then, .. } => {
-                self.collect_and_declare_functions(rhs);
-                self.collect_and_declare_functions(then);
+            Node::Let { rhs, then, .. } => {
+                self.pre_declare(*rhs, nodes, func_arities)?;
+                self.pre_declare(*then, nodes, func_arities)?;
             }
-            Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => {
-                self.collect_and_declare_functions(a);
-                self.collect_and_declare_functions(b);
+            Node::Add(a, b) | Node::Sub(a, b) | Node::Mul(a, b) | Node::Div(a, b) => {
+                self.pre_declare(*a, nodes, func_arities)?;
+                self.pre_declare(*b, nodes, func_arities)?;
             }
-            Expr::Neg(a) => self.collect_and_declare_functions(a),
-            Expr::Call(_, args) => {
-                for arg in args {
-                    self.collect_and_declare_functions(arg);
+            Node::Neg(a) => self.pre_declare(*a, nodes, func_arities)?,
+            Node::Call(_, args) => {
+                for &arg in args {
+                    self.pre_declare(arg, nodes, func_arities)?;
                 }
             }
-            Expr::Num(_) | Expr::Var(_) => {}
+            Node::Num(_) | Node::Var(_) => {}
         }
+        Ok(())
     }
 
-    fn compile_defined_functions<'src>(&mut self, expr: &'src Expr<'src>) {
-        match expr {
-            Expr::Fn {
+    fn compile_functions(
+        &mut self,
+        id: NodeId,
+        nodes: &slotmap::SlotMap<NodeId, Node<'_>>,
+        func_arities: &HashMap<String, usize>,
+    ) -> Result<(), CompilerError> {
+        match &nodes[id] {
+            Node::Fn {
                 name,
                 args,
                 body,
@@ -280,7 +272,6 @@ impl JITCompiler {
                 builder.seal_block(entry_block);
 
                 let mut vars = HashMap::new();
-
                 for (i, arg) in args.iter().enumerate() {
                     let val = builder.block_params(entry_block)[i];
                     let var = builder.declare_var(types::F64);
@@ -292,39 +283,49 @@ impl JITCompiler {
                     builder,
                     module: &mut self.module,
                     funcs: &self.funcs,
+                    func_arities,
+                    nodes,
                     vars,
                 };
 
-                let ret = translator.translate(body);
+                let ret = translator.translate(*body)?;
                 translator.builder.ins().return_(&[ret]);
                 translator.builder.finalize();
 
-                let id = *self.funcs.get(*name).unwrap();
-                self.module.define_function(id, &mut self.ctx).unwrap();
+                let func_id = *self.funcs.get(*name).unwrap();
+                self.module
+                    .define_function(func_id, &mut self.ctx)
+                    .map_err(|e| CompilerError::JitError(e.to_string()))?;
                 self.module.clear_context(&mut self.ctx);
 
-                self.compile_defined_functions(body);
-                self.compile_defined_functions(then);
+                self.compile_functions(*body, nodes, func_arities)?;
+                self.compile_functions(*then, nodes, func_arities)?;
             }
-            Expr::Let { rhs, then, .. } => {
-                self.compile_defined_functions(rhs);
-                self.compile_defined_functions(then);
+            Node::Let { rhs, then, .. } => {
+                self.compile_functions(*rhs, nodes, func_arities)?;
+                self.compile_functions(*then, nodes, func_arities)?;
             }
-            Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) => {
-                self.compile_defined_functions(a);
-                self.compile_defined_functions(b);
+            Node::Add(a, b) | Node::Sub(a, b) | Node::Mul(a, b) | Node::Div(a, b) => {
+                self.compile_functions(*a, nodes, func_arities)?;
+                self.compile_functions(*b, nodes, func_arities)?;
             }
-            Expr::Neg(a) => self.compile_defined_functions(a),
-            Expr::Call(_, args) => {
-                for arg in args {
-                    self.compile_defined_functions(arg);
+            Node::Neg(a) => self.compile_functions(*a, nodes, func_arities)?,
+            Node::Call(_, args) => {
+                for &arg in args {
+                    self.compile_functions(arg, nodes, func_arities)?;
                 }
             }
-            Expr::Num(_) | Expr::Var(_) => {}
+            Node::Num(_) | Node::Var(_) => {}
         }
+        Ok(())
     }
 
-    fn run_main(&mut self, ast: &Expr) -> f64 {
+    fn run_main(
+        &mut self,
+        root: NodeId,
+        nodes: &slotmap::SlotMap<NodeId, Node<'_>>,
+        func_arities: &HashMap<String, usize>,
+    ) -> Result<f64, CompilerError> {
         self.ctx.clear();
         self.ctx
             .func
@@ -341,10 +342,12 @@ impl JITCompiler {
             builder,
             module: &mut self.module,
             funcs: &self.funcs,
+            func_arities,
+            nodes,
             vars: HashMap::new(),
         };
 
-        let ret = translator.translate(ast);
+        let ret = translator.translate(root)?;
         translator.builder.ins().return_(&[ret]);
         translator.builder.finalize();
 
@@ -354,121 +357,169 @@ impl JITCompiler {
         let id = self
             .module
             .declare_function("__main", Linkage::Export, &sig)
-            .unwrap();
-        self.module.define_function(id, &mut self.ctx).unwrap();
+            .map_err(|e| CompilerError::JitError(e.to_string()))?;
+        self.module
+            .define_function(id, &mut self.ctx)
+            .map_err(|e| CompilerError::JitError(e.to_string()))?;
         self.module.clear_context(&mut self.ctx);
-        self.module.finalize_definitions().unwrap();
+
+        self.module
+            .finalize_definitions()
+            .map_err(|e| CompilerError::JitError(e.to_string()))?;
 
         let code = self.module.get_finalized_function(id);
         let func: fn() -> f64 = unsafe { std::mem::transmute(code) };
-        func()
+        Ok(func())
     }
 }
 
-struct Translator<'a, 'm> {
+struct Translator<'a, 'm, 'src> {
     builder: FunctionBuilder<'a>,
     module: &'m mut JITModule,
     funcs: &'m HashMap<String, FuncId>,
-    vars: HashMap<&'a str, Variable>,
+    func_arities: &'m HashMap<String, usize>,
+    nodes: &'src slotmap::SlotMap<NodeId, Node<'src>>,
+    vars: HashMap<&'src str, Variable>,
 }
 
-impl<'a> Translator<'a, '_> {
-    fn translate(&mut self, expr: &'a Expr<'a>) -> Value {
-        match expr {
-            Expr::Num(n) => self.builder.ins().f64const(*n),
-            Expr::Var(name) => {
-                let var = self.vars.get(name).unwrap();
-                self.builder.use_var(*var)
+impl Translator<'_, '_, '_> {
+    fn translate(&mut self, id: NodeId) -> Result<Value, CompilerError> {
+        match &self.nodes[id] {
+            Node::Num(n) => Ok(self.builder.ins().f64const(*n)),
+            Node::Var(name) => {
+                let var = self
+                    .vars
+                    .get(name)
+                    .ok_or_else(|| CompilerError::VariableNotFound((*name).to_string()))?;
+                Ok(self.builder.use_var(*var))
             }
-            Expr::Neg(a) => {
-                let val = self.translate(a);
-                self.builder.ins().fneg(val)
+            Node::Neg(a) => {
+                let val = self.translate(*a)?;
+                Ok(self.builder.ins().fneg(val))
             }
-            Expr::Add(a, b) => {
-                let av = self.translate(a);
-                let bv = self.translate(b);
-                self.builder.ins().fadd(av, bv)
+            Node::Add(a, b) => {
+                let av = self.translate(*a)?;
+                let bv = self.translate(*b)?;
+                Ok(self.builder.ins().fadd(av, bv))
             }
-            Expr::Sub(a, b) => {
-                let av = self.translate(a);
-                let bv = self.translate(b);
-                self.builder.ins().fsub(av, bv)
+            Node::Sub(a, b) => {
+                let av = self.translate(*a)?;
+                let bv = self.translate(*b)?;
+                Ok(self.builder.ins().fsub(av, bv))
             }
-            Expr::Mul(a, b) => {
-                let av = self.translate(a);
-                let bv = self.translate(b);
-                self.builder.ins().fmul(av, bv)
+            Node::Mul(a, b) => {
+                let av = self.translate(*a)?;
+                let bv = self.translate(*b)?;
+                Ok(self.builder.ins().fmul(av, bv))
             }
-            Expr::Div(a, b) => {
-                let av = self.translate(a);
-                let bv = self.translate(b);
-                self.builder.ins().fdiv(av, bv)
+            Node::Div(a, b) => {
+                let av = self.translate(*a)?;
+                let bv = self.translate(*b)?;
+                Ok(self.builder.ins().fdiv(av, bv))
             }
-            Expr::Let { name, rhs, then } => {
-                let rhs_val = self.translate(rhs);
+            Node::Let { name, rhs, then } => {
+                let rhs_val = self.translate(*rhs)?;
                 let var = self.builder.declare_var(types::F64);
                 self.builder.def_var(var, rhs_val);
 
-                let old_var = self.vars.insert(*name, var);
-                let res = self.translate(then);
+                let old_var = self.vars.insert(name, var);
+                let res = self.translate(*then);
 
                 if let Some(old) = old_var {
-                    self.vars.insert(*name, old);
+                    self.vars.insert(name, old);
                 } else {
-                    self.vars.remove(*name);
+                    self.vars.remove(name);
                 }
                 res
             }
-            Expr::Call(name, args) => {
-                let id = self.funcs.get(*name).unwrap();
-                let local_callee = self.module.declare_func_in_func(*id, self.builder.func);
+            Node::Call(name, args) => {
+                let expected_arity = self
+                    .func_arities
+                    .get(*name)
+                    .ok_or_else(|| CompilerError::FunctionNotFound((name).to_string()))?;
+
+                if args.len() != *expected_arity {
+                    return Err(CompilerError::ArgumentCountMismatch {
+                        name: (*name).to_string(),
+                        expected: *expected_arity,
+                        found: args.len(),
+                    });
+                }
+
+                let func_id = self.funcs.get(*name).unwrap();
+                let local_callee = self
+                    .module
+                    .declare_func_in_func(*func_id, self.builder.func);
 
                 let mut arg_vals = Vec::new();
                 for arg in args {
-                    arg_vals.push(self.translate(arg));
+                    arg_vals.push(self.translate(*arg)?);
                 }
 
                 let call = self.builder.ins().call(local_callee, &arg_vals);
-                self.builder.inst_results(call)[0]
+                Ok(self.builder.inst_results(call)[0])
             }
-            Expr::Fn { then, .. } => self.translate(then),
+            Node::Fn { then, .. } => self.translate(*then),
         }
     }
 }
 
-fn codegen(ast: &Expr) -> Result<f64, String> {
-    validate(ast, &mut Vec::new(), &mut HashMap::new())?;
-
+fn codegen(root: NodeId, nodes: &slotmap::SlotMap<NodeId, Node<'_>>) -> Result<f64, CompilerError> {
     let mut jit = JITCompiler::new();
-    jit.collect_and_declare_functions(ast);
-    jit.compile_defined_functions(ast);
-    Ok(jit.run_main(ast))
+    let mut func_arities = HashMap::new();
+
+    jit.pre_declare(root, nodes, &mut func_arities)?;
+    jit.compile_functions(root, nodes, &func_arities)?;
+    jit.run_main(root, nodes, &func_arities)
+}
+
+#[derive(ClapParser, Debug)]
+#[command(name = "foo-compiler", version, about, long_about = None)]
+struct Args {
+    #[arg(value_name = "FILE")]
+    file: PathBuf,
 }
 
 fn main() {
-    let src = std::fs::read_to_string(std::env::args().nth(1).expect("expected file argument"))
-        .expect("failed to read file");
+    let args = Args::parse();
 
-    let (ast, errs) = parser().parse(&src).into_output_errors();
+    let file_path_str = args.file.to_string_lossy().into_owned();
+
+    let src = std::fs::read_to_string(&args.file).unwrap_or_else(|err| {
+        eprintln!("Error: Failed to read file '{file_path_str}': {err}");
+        std::process::exit(1);
+    });
+
+    let arena = RefCell::new(slotmap::SlotMap::<NodeId, _>::with_key());
+    let (ast, errs) = parser(&arena).parse(&src).into_output_errors();
 
     for e in errs {
-        Report::build(ReportKind::Error, ((), e.span().into_range()))
-            .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Byte))
-            .with_message(e.to_string())
-            .with_label(
-                Label::new(((), e.span().into_range()))
-                    .with_message(e.reason().to_string())
-                    .with_color(Color::Red),
-            )
-            .finish()
-            .print(Source::from(&src))
-            .unwrap();
+        Report::build(
+            ReportKind::Error,
+            (file_path_str.clone(), e.span().into_range()),
+        )
+        .with_config(ariadne::Config::new().with_index_type(ariadne::IndexType::Char))
+        .with_message(e.to_string())
+        .with_label(
+            Label::new((file_path_str.clone(), e.span().into_range()))
+                .with_message(e.reason().to_string())
+                .with_color(Color::Red),
+        )
+        .finish()
+        .eprint((file_path_str.clone(), Source::from(src.as_str())))
+        .unwrap();
     }
 
-    if let Some(ast) = ast {
-        match codegen(&ast) {
+    if let Some(root_id) = ast {
+        let nodes = arena.into_inner();
+        match codegen(root_id, &nodes) {
             Ok(output) => println!("{output}"),
-            Err(eval_err) => println!("Evaluation error: {eval_err}"),
+            Err(compiler_err) => {
+                eprintln!("Compilation failed: {compiler_err}");
+                std::process::exit(1);
+            }
         }
+    } else {
+        std::process::exit(1);
     }
 }
