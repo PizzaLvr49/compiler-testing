@@ -496,7 +496,7 @@ fn main() -> ExitCode {
         Ok(content) => content,
         Err(err) => {
             eprintln!("Error: Failed to read file '{file_path_str}': {err}");
-            return ExitCode::IoErr;
+            return ExitCode::NoInput;
         }
     };
 
@@ -526,7 +526,7 @@ fn main() -> ExitCode {
             Ok(output) => println!("{output}"),
             Err(compiler_err) => {
                 eprintln!("Compilation failed: {compiler_err}");
-                return ExitCode::DataErr;
+                return ExitCode::Software;
             }
         }
     }
