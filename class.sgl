@@ -1,4 +1,13 @@
-class Player(name: string, health: number, speed: number)
+interface Damageable
+    function takeDamage(amount: number)
+end
+
+interface Alive
+    function isDead(): boolean
+end
+
+# no inheritance just composition by interfaces (not types) that only define method contracts
+class Player(name: string, health: number, speed: number) : Damageable, Alive
     assert(health > 0, "Initial health must be greater than zero")
 
     function isDead(): boolean
