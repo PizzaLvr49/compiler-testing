@@ -1,0 +1,27 @@
+type Coordinate = (number, number)
+
+type Generic<T> = (number, T[])
+
+type HasName = { name: string }
+type HasAge = { age: number }
+
+type Person = HasName & HasAge
+
+# now typeof number != typeof USD != typeof Health
+nominal type USD = number
+nominal type Health = { current: number, max: number }
+
+# literals can be implicity casted to nominals
+let wallet: USD = 100.0 
+let health: Health = { current: 100, max: 100 }
+
+# this fails because you cant implicity cast nominals
+let rawNum = 50.0
+let brokenWallet: USD = rawNum
+
+let rawNum = 50.0
+let fixedWallet: USD = rawNum :: USD # this works though since explicit casting always works
+
+let brokenHealth = fixedWallet :: Health # oh no! casting must still be structurally sound
+
+let rawHealth = health :: { current: number, max: number } # this will convert the nominal into a normal structual type

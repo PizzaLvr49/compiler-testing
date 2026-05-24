@@ -1,0 +1,34 @@
+# note about enums is that they are implicitly and strictly nominal
+enum Status
+    Idle
+    Loading
+    Suspended
+    Terminated
+end
+
+# implicit none and 2^x bit values completly masks numbers these exist as numbers in runtime but completly sealed from user
+flags enum Permissions
+    Read
+    Write
+    Execute
+    Admin
+end
+
+# Using flags inside a class structure
+class User(name: string, perms: Permissions)
+    function canWrite(): boolean
+        # Bitwise AND
+        return (self.perms & Permissions.Write) != 0
+    end
+
+    function grantWrite()
+        # Bitwise OR
+        self.perms = self.perms | Permissions.Write
+    end
+end
+
+let player = User("Arthur", Permissions.Read | Permissions.Execute)
+println(player:canWrite()) # false
+
+player:grantWrite()
+println(player:canWrite()) # true
