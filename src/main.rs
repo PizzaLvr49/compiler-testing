@@ -59,7 +59,6 @@ enum CompilerError {
     JitError(String),
 }
 
-#[expect(clippy::let_and_return)]
 fn parser<'src, 'a>(
     arena: &'a RefCell<slotmap::SlotMap<NodeId, Node<'src>>>,
 ) -> impl Parser<'src, &'src str, NodeId, extra::Err<Rich<'src, char>>> + 'a {
@@ -108,7 +107,7 @@ fn parser<'src, 'a>(
             },
         );
 
-        let sum = product.clone().foldl(
+        product.clone().foldl(
             choice((op('+').to(0), op('-').to(1)))
                 .then(product)
                 .repeated(),
@@ -119,9 +118,7 @@ fn parser<'src, 'a>(
                     alloc(Node::Sub(lhs, rhs))
                 }
             },
-        );
-
-        sum
+        )
     });
 
     let decl = recursive(|decl| {
@@ -369,8 +366,17 @@ impl JITCompiler {
             .map_err(|e| CompilerError::JitError(e.to_string()))?;
 
         let code = self.module.get_finalized_function(id);
-        let func: extern "C" fn() -> f64 = unsafe { std::mem::transmute(code) };
-        Ok(func())
+        #[expect(
+            unsafe_code,
+            reason = "There are two uses of unsafe in this code block because the actual act of compiling and executing code on the fly is innately unsafe. For one, there is no way of verifying we are calling get_function() with the right function signature. It is also unsafe to call the function we get because there's no guarantee the code itself doesn't do unsafe things internally (the same reason you need unsafe when calling into C)."
+        )]
+        let result = unsafe {
+            let func: unsafe extern "C" fn() -> f64 = std::mem::transmute(code);
+
+            func()
+        };
+
+        Ok(result)
     }
 }
 

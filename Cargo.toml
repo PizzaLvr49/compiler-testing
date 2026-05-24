@@ -19,3 +19,7 @@ thiserror = "2.0.18"
 [lints.clippy]
 pedantic = { priority = -1, level = "warn" }
 nursery = { priority = -1, level = "warn" }
+allow_attributes_without_reason = "deny"
+
+[lints.rust]
+unsafe_code = "deny"
