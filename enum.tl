@@ -18,7 +18,7 @@ end
 class User(name: string, perms: Permissions)
     function canWrite(): boolean
         # Bitwise AND
-        return (self.perms & Permissions.Write) != 0
+        return (self.perms & Permissions.Write) != Permissions.None
     end
 
     function grantWrite()
