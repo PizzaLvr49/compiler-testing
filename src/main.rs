@@ -480,15 +480,40 @@ struct Args {
     file: PathBuf,
 }
 
-fn main() {
-    let args = Args::parse();
+enum ExitCode {
+    Success,
+    UsageError,
+    CompileError,
+}
+
+impl std::process::Termination for ExitCode {
+    fn report(self) -> std::process::ExitCode {
+        match self {
+            Self::Success => std::process::ExitCode::SUCCESS,
+            Self::UsageError => std::process::ExitCode::from(64),
+            Self::CompileError => std::process::ExitCode::from(65),
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let args = match Args::try_parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::UsageError;
+        }
+    };
 
     let file_path_str = args.file.to_string_lossy().into_owned();
 
-    let src = std::fs::read_to_string(&args.file).unwrap_or_else(|err| {
-        eprintln!("Error: Failed to read file '{file_path_str}': {err}");
-        std::process::exit(1);
-    });
+    let src = match std::fs::read_to_string(&args.file) {
+        Ok(content) => content,
+        Err(err) => {
+            eprintln!("Error: Failed to read file '{file_path_str}': {err}");
+            return ExitCode::UsageError;
+        }
+    };
 
     let arena = RefCell::new(slotmap::SlotMap::<NodeId, _>::with_key());
     let (ast, errs) = parser(&arena).parse(&src).into_output_errors();
@@ -516,10 +541,9 @@ fn main() {
             Ok(output) => println!("{output}"),
             Err(compiler_err) => {
                 eprintln!("Compilation failed: {compiler_err}");
-                std::process::exit(1);
+                return ExitCode::CompileError;
             }
         }
-    } else {
-        std::process::exit(1);
     }
+    ExitCode::Success
 }
