@@ -495,8 +495,18 @@ fn main() -> ExitCode {
     let src = match std::fs::read_to_string(&args.file) {
         Ok(content) => content,
         Err(err) => {
-            eprintln!("Error: Failed to read file '{file_path_str}': {err}");
-            return ExitCode::NoInput;
+            eprintln!(
+                "Error: Failed to read file '{}': {err}",
+                args.file.display()
+            );
+            match err.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                    return sysexits::ExitCode::NoInput;
+                }
+                _ => {
+                    return sysexits::ExitCode::IoErr;
+                }
+            }
         }
     };
 
