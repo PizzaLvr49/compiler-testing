@@ -16,6 +16,14 @@ slotmap = "1.1.1"
 sysexits = "0.13.0"
 thiserror = "2.0.18"
 
+[profile.release]
+opt-level = 3
+debug = false
+strip = "symbols"
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+
 [lints.clippy]
 pedantic = { priority = -1, level = "warn" }
 nursery = { priority = -1, level = "warn" }

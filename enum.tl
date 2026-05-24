@@ -7,7 +7,7 @@ enum Status
 end
 
 # implicit none and 2^x bit values completly masks numbers these exist as numbers in runtime but completly sealed from user
-flags enum Permissions
+flags Permissions
     Read
     Write
     Execute
