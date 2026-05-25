@@ -4,6 +4,7 @@ use clap::Parser as ClapParser;
 use cranelift::jit::{JITBuilder, JITModule};
 use cranelift::module::{FuncId, Linkage, Module, default_libcall_names};
 use cranelift::prelude::*;
+use slotmap::SlotMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,7 +61,7 @@ enum CompilerError {
 }
 
 fn parser<'src, 'a>(
-    arena: &'a RefCell<slotmap::SlotMap<NodeId, Node<'src>>>,
+    arena: &'a RefCell<SlotMap<NodeId, Node<'src>>>,
 ) -> impl Parser<'src, &'src str, NodeId, extra::Err<Rich<'src, char>>> + 'a {
     let alloc = move |node| arena.borrow_mut().insert(node);
 
@@ -186,7 +187,7 @@ impl JITCompiler {
     fn pre_declare(
         &mut self,
         id: NodeId,
-        nodes: &slotmap::SlotMap<NodeId, Node<'_>>,
+        nodes: &SlotMap<NodeId, Node<'_>>,
         func_arities: &mut HashMap<String, usize>,
     ) -> Result<(), CompilerError> {
         match &nodes[id] {
@@ -238,7 +239,7 @@ impl JITCompiler {
     fn compile_functions(
         &mut self,
         id: NodeId,
-        nodes: &slotmap::SlotMap<NodeId, Node<'_>>,
+        nodes: &SlotMap<NodeId, Node<'_>>,
         func_arities: &HashMap<String, usize>,
     ) -> Result<(), CompilerError> {
         match &nodes[id] {
@@ -321,7 +322,7 @@ impl JITCompiler {
     fn run_main(
         &mut self,
         root: NodeId,
-        nodes: &slotmap::SlotMap<NodeId, Node<'_>>,
+        nodes: &SlotMap<NodeId, Node<'_>>,
         func_arities: &HashMap<String, usize>,
     ) -> Result<f64, CompilerError> {
         self.ctx.clear();
@@ -385,7 +386,7 @@ struct Translator<'a, 'm, 'src> {
     module: &'m mut JITModule,
     funcs: &'m HashMap<String, FuncId>,
     func_arities: &'m HashMap<String, usize>,
-    nodes: &'src slotmap::SlotMap<NodeId, Node<'src>>,
+    nodes: &'src SlotMap<NodeId, Node<'src>>,
     vars: HashMap<&'src str, Variable>,
 }
 
@@ -471,7 +472,7 @@ impl Translator<'_, '_, '_> {
     }
 }
 
-fn codegen(root: NodeId, nodes: &slotmap::SlotMap<NodeId, Node<'_>>) -> Result<f64, CompilerError> {
+fn codegen(root: NodeId, nodes: &SlotMap<NodeId, Node<'_>>) -> Result<f64, CompilerError> {
     let mut jit = JITCompiler::new();
     let mut func_arities = HashMap::new();
 
@@ -507,16 +508,16 @@ fn main() -> ExitCode {
             );
             match err.kind() {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
-                    return sysexits::ExitCode::NoInput;
+                    return ExitCode::NoInput;
                 }
                 _ => {
-                    return sysexits::ExitCode::IoErr;
+                    return ExitCode::IoErr;
                 }
             }
         }
     };
 
-    let arena = RefCell::new(slotmap::SlotMap::<NodeId, _>::with_key());
+    let arena = RefCell::new(SlotMap::<NodeId, _>::with_key());
     let (ast, errs) = parser(&arena).parse(&src).into_output_errors();
 
     for e in errs {
