@@ -28,3 +28,22 @@ hero:takeDamage(45.0)
 
 let healingFactor = 2.5 * 4.0 ^ 0.5 + 1.0
 println(healingFactor)
+
+class EnemyTracker(range: number)
+    current: Enemy? = nil # ? semantics from C#
+
+    function getNearest(): Enemy? # maybe nil
+        return self.current
+    end
+
+    function getHealth(): number? # maybe nil
+        return self.current?.health
+    end
+
+    function getDisplayName(): string
+        return self.current?.name ?? "No Target" # nil coalescing
+    end
+end
+
+let tracker = EnemyTracker(50.0)
+let name = tracker:getNearest()?.name ?? "unknown" # nil coalescing
